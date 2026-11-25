@@ -1,0 +1,6 @@
+# /etc/caddy/Caddyfile (after `apt install caddy` from the official cloudsmith repo)
+# TLS certificates are issued and renewed automatically.
+lark-mcp.example.com {
+	encode zstd gzip
+	reverse_proxy 127.0.0.1:3333
+}

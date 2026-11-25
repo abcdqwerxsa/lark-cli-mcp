@@ -1,0 +1,168 @@
+# lark-mcp on k3s (oci-arm2). Copy to k8s.yaml, fill LARK_MCP_CLIENTS, apply.
+# on the host at /opt/lark-mcp/app, ~17 KB) and runs on the official node:24
+# image. An initContainer (same image) installs npm deps and fetches the
+# official lark-cli Go binary from GitHub (sha256-verified against the
+# checksums.txt shipped inside the npm tarball) into an emptyDir.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: lark-mcp-env
+  namespace: default
+stringData:
+  # clients: "id:secret" pairs. Generate with: openssl rand -hex 32
+  LARK_MCP_CLIENTS: "__CLIENTS__"
+  LARK_MCP_PUBLIC_URL: "https://lark.nilpo.org"
+  LARK_MCP_TOKEN_TTL: "3600"
+  LARK_MCP_REFRESH_TTL: "2592000"
+  LARK_MCP_MAX_OUTPUT: "65536"
+  LARK_MCP_TIMEOUT_MS: "90000"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lark-mcp
+  namespace: default
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate   # hostPath data dir, single writer
+  selector:
+    matchLabels:
+      app: lark-mcp
+  template:
+    metadata:
+      labels:
+        app: lark-mcp
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      initContainers:
+        - name: install
+          image: docker.io/library/node:24-bookworm-slim
+          securityContext:
+            runAsUser: 0   # apt needs root; app itself still runs as node (1000)
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              # node:*-slim ships no CA bundle; lark-cli needs it for every Feishu API call.
+              apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates >/dev/null
+              mkdir -p /etc-pki/certs && cp -L /etc/ssl/certs/* /etc-pki/certs/
+              cd /work
+              npm ci --omit=dev --no-audit --no-fund
+              # lark-cli: pull the npm tarball only for its checksums.txt, then fetch the arm64 Go binary.
+              v=$(npm view @larksuite/cli version)
+              npm pack @larksuite/cli@$v --silent
+              tar xzf larksuite-cli-*.tgz package/checksums.txt
+              f=lark-cli-$v-linux-arm64.tar.gz
+              node -e '
+                const fs=require("fs"),v=process.argv[1],f=process.argv[2];
+                (async()=>{for(let i=0;i<3;i++){try{
+                  const r=await fetch(`https://github.com/larksuite/cli/releases/download/v${v}/${f}`);
+                  if(!r.ok) throw new Error("HTTP "+r.status);
+                  const b=Buffer.from(await r.arrayBuffer()); fs.writeFileSync(`/tools/${f}`,b); return;
+                }catch(e){if(i===2) throw e; await new Promise(r=>setTimeout(r,2000));}}})()' "$v" "$f"
+              grep " $f\$" package/checksums.txt > /tmp/one.txt
+              (cd /tools && sha256sum -c /tmp/one.txt && tar xzf $f lark-cli && chmod +x lark-cli && rm $f)
+              /tools/lark-cli --version
+          volumeMounts:
+            - name: app
+              mountPath: /work
+            - name: tools
+              mountPath: /tools
+            - name: pki
+              mountPath: /etc-pki
+      containers:
+        - name: lark-mcp
+          image: docker.io/library/node:24-bookworm-slim
+          command: ["node", "src/index.mjs"]
+          workingDir: /app
+          ports:
+            - containerPort: 3333
+          env:
+            - name: HOST
+              value: "0.0.0.0"
+            - name: LARK_CLI_BIN
+              value: /tools/lark-cli
+            - name: LARKSUITE_CLI_CONFIG_DIR
+              value: /data
+            # lark-cli keeps app secret / user tokens / DPoP keys in its "keychain",
+            # which lives under LARKSUITE_CLI_DATA_DIR (default ~/.local/share) — the
+            # container home is ephemeral, so pin it to the persistent volume too.
+            - name: LARKSUITE_CLI_DATA_DIR
+              value: /data
+          envFrom:
+            - secretRef:
+                name: lark-mcp-env
+          volumeMounts:
+            - name: pki
+              mountPath: /etc/ssl/certs
+              subPath: certs
+              readOnly: true
+            - name: app
+              mountPath: /app
+              readOnly: true
+            - name: tools
+              mountPath: /tools
+              readOnly: true
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 3333
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 384Mi
+      volumes:
+        - name: app
+          hostPath:
+            path: /opt/lark-mcp/app
+            type: Directory
+        - name: tools
+          emptyDir: {}
+        - name: pki
+          emptyDir: {}
+        - name: data
+          hostPath:
+            path: /opt/lark-mcp/data
+            type: DirectoryOrCreate
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lark-mcp
+  namespace: default
+spec:
+  selector:
+    app: lark-mcp
+  ports:
+    - port: 3333
+      targetPort: 3333
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lark-mcp
+  namespace: default
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+spec:
+  rules:
+    - host: lark.nilpo.org
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: lark-mcp
+                port:
+                  number: 3333
+  tls:
+    - hosts:
+        - lark.nilpo.org

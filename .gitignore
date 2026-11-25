@@ -1,0 +1,4 @@
+node_modules/
+deploy/clients.txt
+deploy/k8s.yaml
+*.tgz
